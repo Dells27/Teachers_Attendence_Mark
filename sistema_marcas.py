@@ -234,13 +234,22 @@ class AppPrincipal(tk.Tk):
         ).pack(pady=(0, 8))
 
     def abrir_registro(self):
-        VentanaRegistro(self)
+        if hasattr(self, "_win_registro") and self._win_registro.winfo_exists():
+            self._win_registro.lift()
+            return
+        self._win_registro = VentanaRegistro(self)
 
     def abrir_marcas(self):
-        VentanaMarcas(self)
+        if hasattr(self, "_win_marcas") and self._win_marcas.winfo_exists():
+            self._win_marcas.lift()
+            return
+        self._win_marcas = VentanaMarcas(self)
 
     def abrir_reportes(self):
-        VentanaReportes(self)
+        if hasattr(self, "_win_reportes") and self._win_reportes.winfo_exists():
+            self._win_reportes.lift()
+            return
+        self._win_reportes = VentanaReportes(self)
 
 
 # ──────────────────────────────────────────
@@ -313,10 +322,16 @@ class VentanaRegistro(tk.Toplevel):
 
         cap = cv2.VideoCapture(0)
         if not cap.isOpened():
-            messagebox.showerror("Error", "No se pudo abrir la cámara.")
+            messagebox.showerror(
+                "Cámara no disponible",
+                "No se pudo abrir la cámara.\n"
+                "Verificá que esté conectada y no en uso por otra aplicación."
+            )
             return
 
         fotos = []
+        avisos_sin_cara = 0  # para no spamear el aviso
+
         while True:
             ret, frame = cap.read()
             if not ret:
@@ -331,10 +346,19 @@ class VentanaRegistro(tk.Toplevel):
             small = cv2.resize(frame, (0, 0), fx=0.25, fy=0.25)
             rgb_small = cv2.cvtColor(small, cv2.COLOR_BGR2RGB)
             locs = face_recognition.face_locations(rgb_small)
-            for (top, right, bottom, left) in locs:
-                cv2.rectangle(display,
-                              (left*4, top*4), (right*4, bottom*4),
-                              (0, 200, 0), 2)
+
+            if locs:
+                avisos_sin_cara = 0
+                for (top, right, bottom, left) in locs:
+                    cv2.rectangle(display,
+                                  (left*4, top*4), (right*4, bottom*4),
+                                  (0, 200, 0), 2)
+                cv2.putText(display, "Cara detectada ✓", (10, 60),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 200, 0), 2)
+            else:
+                avisos_sin_cara += 1
+                cv2.putText(display, "No se detecta cara — ajusta posicion",
+                            (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 80, 255), 2)
 
             cv2.imshow("Captura de fotos — " + nombre, display)
             key = cv2.waitKey(1)
@@ -342,23 +366,40 @@ class VentanaRegistro(tk.Toplevel):
             if key == 27:   # ESC
                 break
             if key == 32:   # ESPACIO
-                if locs:
-                    fotos.append(frame.copy())
-                    self.fotos_capturadas = fotos
-                    self.status_fotos.config(text=f"Fotos capturadas: {len(fotos)} / 5")
-                    self.barra["value"] = len(fotos)
-                    self.update()
-                    if len(fotos) >= 5:
-                        break
-                else:
-                    cv2.putText(display, "No se detecta cara",
-                                (10, 70), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+                if not locs:
+                    # Mostrar aviso brevemente en cámara, no interrumpir con popup
+                    cv2.putText(display, "⚠ Ninguna cara visible — no se capturó",
+                                (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
+                    cv2.imshow("Captura de fotos — " + nombre, display)
+                    cv2.waitKey(800)
+                    continue
+
+                if len(locs) > 1:
+                    cv2.putText(display, "⚠ Más de una cara — acercate solo tú",
+                                (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 140, 255), 2)
+                    cv2.imshow("Captura de fotos — " + nombre, display)
+                    cv2.waitKey(800)
+                    continue
+
+                fotos.append(frame.copy())
+                self.fotos_capturadas = fotos
+                self.status_fotos.config(text=f"Fotos capturadas: {len(fotos)} / 5")
+                self.barra["value"] = len(fotos)
+                self.update()
+                if len(fotos) >= 5:
+                    break
 
         cap.release()
         cv2.destroyAllWindows()
-        self.info_label.config(
-            text=f"✅ {len(fotos)} foto(s) capturadas. Pulsa 'Guardar Profesor' para continuar."
-        )
+
+        if len(fotos) == 0:
+            self.info_label.config(
+                text="⚠ No se capturó ninguna foto. Intentá de nuevo con mejor iluminación."
+            )
+        else:
+            self.info_label.config(
+                text=f"✅ {len(fotos)} foto(s) capturadas. Pulsa 'Guardar Profesor' para continuar."
+            )
 
     def guardar_profesor(self):
         nombre = self.nombre_var.get().strip()
@@ -366,7 +407,14 @@ class VentanaRegistro(tk.Toplevel):
             messagebox.showwarning("Falta nombre", "Ingresa el nombre del profesor.")
             return
         if len(self.fotos_capturadas) == 0:
-            messagebox.showwarning("Sin fotos", "Captura al menos una foto primero.")
+            messagebox.showwarning(
+                "Sin fotos",
+                "Capturá al menos una foto antes de guardar.\n\n"
+                "Consejos para mejores resultados:\n"
+                "• Buena iluminación frontal\n"
+                "• Mirá directo a la cámara\n"
+                "• Evitá gorras o lentes de sol"
+            )
             return
 
         # Guardar fotos en carpeta
@@ -375,25 +423,39 @@ class VentanaRegistro(tk.Toplevel):
         for i, foto in enumerate(self.fotos_capturadas):
             cv2.imwrite(str(carpeta / f"{i+1}.jpg"), foto)
 
-        # Generar encodings
+        # Generar encodings con reporte de cuántas fallaron
         encodings = cargar_encodings()
         lista_enc = []
+        fotos_sin_cara = 0
+
         for foto in self.fotos_capturadas:
             rgb = cv2.cvtColor(foto, cv2.COLOR_BGR2RGB)
             locs = face_recognition.face_locations(rgb)
             if locs:
                 enc = face_recognition.face_encodings(rgb, locs)[0]
                 lista_enc.append(enc)
+            else:
+                fotos_sin_cara += 1
 
         if not lista_enc:
-            messagebox.showerror("Error", "No se pudo generar el encoding facial. Intenta con mejores fotos.")
+            messagebox.showerror(
+                "No se pudo registrar",
+                "Ninguna de las fotos tuvo una cara reconocible.\n\n"
+                "Intentá de nuevo con:\n"
+                "• Mejor iluminación\n"
+                "• Cara más centrada y de frente\n"
+                "• Sin obstáculos (manos, objetos)"
+            )
             return
 
         encodings[nombre] = lista_enc
         guardar_encodings(encodings)
 
-        messagebox.showinfo("✅ Listo",
-                            f"Profesor '{nombre}' registrado con {len(lista_enc)} foto(s).")
+        msg = f"Profesor '{nombre}' registrado con {len(lista_enc)} foto(s) válida(s)."
+        if fotos_sin_cara > 0:
+            msg += f"\n({fotos_sin_cara} foto(s) descartadas por no tener cara clara)"
+
+        messagebox.showinfo("✅ Listo", msg)
         self.destroy()
 
 
@@ -454,6 +516,11 @@ class VentanaMarcas(tk.Toplevel):
         self.after(0, _escribir)
 
     def iniciar(self):
+        # Guard: no iniciar si ya hay un hilo corriendo
+        if self._corriendo:
+            messagebox.showwarning("Cámara activa", "La cámara ya está en uso. Presiná Detener primero.")
+            return
+
         encodings = cargar_encodings()
         if not encodings:
             messagebox.showwarning("Sin profesores",
@@ -463,16 +530,30 @@ class VentanaMarcas(tk.Toplevel):
         todos_enc = [enc for lista in encodings.values() for enc in lista]
         etiquetas = [nombre for nombre, lista in encodings.items() for _ in lista]
 
-        cap = cv2.VideoCapture(0)
-        if not cap.isOpened():
-            messagebox.showerror("Error", "No se pudo abrir la cámara.")
+        # Intentar abrir la cámara con reintentos
+        cap = None
+        for intento in range(3):
+            cap = cv2.VideoCapture(0)
+            if cap.isOpened():
+                break
+            cap.release()
+            cap = None
+
+        if cap is None:
+            messagebox.showerror(
+                "Cámara no disponible",
+                "No se pudo conectar a la cámara después de 3 intentos.\n\n"
+                "Verificá que:\n"
+                "• La cámara esté conectada al equipo\n"
+                "• No esté siendo usada por otra aplicación\n"
+                "• Los drivers estén instalados correctamente"
+            )
             return
 
         self._corriendo = True
         self.btn_iniciar.config(state="disabled")
         self.btn_detener.config(state="normal")
 
-        # Lanzar el loop de cámara en un hilo separado
         import threading
         self._hilo = threading.Thread(
             target=self._loop_camara,
@@ -495,10 +576,23 @@ class VentanaMarcas(tk.Toplevel):
         self.after(0, lambda: self.log_msg("▶ Cámara iniciada. Esperando profesores..."))
         ultimo_reconocido = {}
 
+        fallos_consecutivos = 0
+        MAX_FALLOS = 30  # ~1 segundo a 30fps
+
         while self._corriendo:
             ret, frame = cap.read()
             if not ret:
-                break
+                fallos_consecutivos += 1
+                if fallos_consecutivos >= MAX_FALLOS:
+                    self.log_msg("⚠  Cámara desconectada o sin señal.")
+                    self.after(0, lambda: messagebox.showerror(
+                        "Cámara perdida",
+                        "La cámara se desconectó durante la sesión.\n"
+                        "Reconectá el dispositivo y volvé a iniciar."
+                    ))
+                    break
+                continue
+            fallos_consecutivos = 0
 
             small = cv2.resize(frame, (0, 0), fx=0.25, fy=0.25)
             rgb_small = cv2.cvtColor(small, cv2.COLOR_BGR2RGB)
