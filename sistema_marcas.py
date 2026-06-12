@@ -14,14 +14,20 @@ import json
 import pickle
 from datetime import datetime
 from pathlib import Path
+import sys
 
 # ──────────────────────────────────────────
 # CONFIGURACIÓN DE CARPETAS
 # ──────────────────────────────────────────
-BASE_DIR     = Path(__file__).parent
-FOTOS_DIR    = BASE_DIR / "profesores_fotos"
+# Detecta si corre como .exe (PyInstaller) o como script normal
+if getattr(sys, 'frozen', False):
+    BASE_DIR = Path(sys.executable).parent
+else:
+    BASE_DIR = Path(__file__).parent
+
+FOTOS_DIR      = BASE_DIR / "profesores_fotos"
 ENCODINGS_FILE = BASE_DIR / "encodings.pkl"
-MARCAS_FILE  = BASE_DIR / "marcas.xlsx"
+MARCAS_FILE    = BASE_DIR / "marcas.xlsx"
 
 FOTOS_DIR.mkdir(exist_ok=True)
 
@@ -31,10 +37,28 @@ FOTOS_DIR.mkdir(exist_ok=True)
 # ──────────────────────────────────────────
 def cargar_encodings():
     """Carga los encodings faciales guardados."""
-    if ENCODINGS_FILE.exists():
+    if not ENCODINGS_FILE.exists():
+        return {}
+    try:
         with open(ENCODINGS_FILE, "rb") as f:
-            return pickle.load(f)
-    return {}  # {nombre: [encoding1, encoding2, ...]}
+            datos = pickle.load(f)
+        if not isinstance(datos, dict):
+            raise ValueError("Formato inesperado")
+        return datos
+    except Exception:
+        # Archivo corrupto: hacer backup y arrancar limpio
+        backup = ENCODINGS_FILE.with_suffix(".pkl.bak")
+        try:
+            ENCODINGS_FILE.rename(backup)
+        except Exception:
+            pass
+        messagebox.showwarning(
+            "Archivo de encodings dañado",
+            "El archivo de reconocimiento facial estaba corrupto y fue respaldado como\n"
+            f"'{backup.name}'.\n\n"
+            "Los profesores deberán registrarse nuevamente."
+        )
+        return {}
 
 
 def guardar_encodings(encodings):
@@ -46,12 +70,33 @@ def registrar_marca(nombre):
     """Agrega una fila al Excel con entrada o salida."""
     hoy = datetime.now().strftime("%Y-%m-%d")
     hora = datetime.now().strftime("%H:%M:%S")
+    COLUMNAS = ["Nombre", "Fecha", "Hora", "Tipo"]
 
     # Cargar marcas existentes
     if MARCAS_FILE.exists():
-        df = pd.read_excel(MARCAS_FILE)
+        try:
+            df = pd.read_excel(MARCAS_FILE)
+            # Validar que tenga las columnas esperadas
+            cols_faltantes = [c for c in COLUMNAS if c not in df.columns]
+            if cols_faltantes:
+                raise ValueError(f"Columnas faltantes: {cols_faltantes}")
+        except Exception as e:
+            # Archivo dañado o editado incorrectamente — hacer backup y empezar limpio
+            backup = MARCAS_FILE.with_suffix(".bak.xlsx")
+            try:
+                import shutil
+                shutil.copy(str(MARCAS_FILE), str(backup))
+            except Exception:
+                pass
+            df = pd.DataFrame(columns=COLUMNAS)
+            messagebox.showwarning(
+                "Archivo de marcas con problemas",
+                f"El archivo 'marcas.xlsx' tenía un formato inesperado ({e}).\n\n"
+                f"Se respaldó como '{backup.name}' y se creó uno nuevo.\n"
+                "Las marcas anteriores están en el respaldo."
+            )
     else:
-        df = pd.DataFrame(columns=["Nombre", "Fecha", "Hora", "Tipo"])
+        df = pd.DataFrame(columns=COLUMNAS)
 
     # Determinar si es entrada o salida
     marcas_hoy = df[(df["Nombre"] == nombre) & (df["Fecha"] == hoy)]
@@ -367,7 +412,6 @@ class VentanaRegistro(tk.Toplevel):
                 break
             if key == 32:   # ESPACIO
                 if not locs:
-                    # Mostrar aviso brevemente en cámara, no interrumpir con popup
                     cv2.putText(display, "⚠ Ninguna cara visible — no se capturó",
                                 (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
                     cv2.imshow("Captura de fotos — " + nombre, display)
@@ -417,6 +461,19 @@ class VentanaRegistro(tk.Toplevel):
             )
             return
 
+        # Validar nombre duplicado
+        encodings = cargar_encodings()
+        if nombre in encodings:
+            actualizar = messagebox.askyesno(
+                "Profesor ya registrado",
+                f"'{nombre}' ya existe en el sistema.\n\n"
+                "¿Querés reemplazar sus fotos con las nuevas capturas?\n\n"
+                "• Sí → actualizar\n"
+                "• No → cancelar y volver"
+            )
+            if not actualizar:
+                return
+
         # Guardar fotos en carpeta
         carpeta = FOTOS_DIR / nombre
         carpeta.mkdir(exist_ok=True)
@@ -424,7 +481,6 @@ class VentanaRegistro(tk.Toplevel):
             cv2.imwrite(str(carpeta / f"{i+1}.jpg"), foto)
 
         # Generar encodings con reporte de cuántas fallaron
-        encodings = cargar_encodings()
         lista_enc = []
         fotos_sin_cara = 0
 
@@ -716,10 +772,32 @@ class VentanaReportes(tk.Toplevel):
         self._limpiar_tabla()
         if not MARCAS_FILE.exists():
             return
-        df = pd.read_excel(MARCAS_FILE)
+
         fecha = self.fecha_var.get().strip()
+
+        # Validar formato de fecha si se ingresó algo
+        if fecha:
+            try:
+                datetime.strptime(fecha, "%Y-%m-%d")
+            except ValueError:
+                messagebox.showwarning(
+                    "Fecha inválida",
+                    f"'{fecha}' no es un formato válido.\n\n"
+                    "Usá el formato: YYYY-MM-DD\n"
+                    "Ejemplo: 2025-06-09"
+                )
+                return
+
+        try:
+            df = pd.read_excel(MARCAS_FILE)
+        except Exception as e:
+            messagebox.showerror("Error al leer marcas",
+                                 f"No se pudo abrir el archivo de marcas.\n\nDetalle: {e}")
+            return
+
         if fecha:
             df = df[df["Fecha"] == fecha]
+
         for _, row in df.iterrows():
             tag = "entrada" if row["Tipo"] == "Entrada" else "salida"
             self.tree.insert("", "end",
@@ -740,7 +818,7 @@ class VentanaReportes(tk.Toplevel):
         if not MARCAS_FILE.exists():
             messagebox.showinfo("Sin datos", "Aún no hay marcas registradas.")
             return
-        import subprocess, sys
+        import subprocess
         if sys.platform == "win32":
             os.startfile(str(MARCAS_FILE))
         elif sys.platform == "darwin":
