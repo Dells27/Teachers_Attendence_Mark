@@ -12,14 +12,15 @@ import pandas as pd
 import os
 import json
 import pickle
+import sys
 from datetime import datetime
 from pathlib import Path
-import sys
 
 # ──────────────────────────────────────────
 # CONFIGURACIÓN DE CARPETAS
 # ──────────────────────────────────────────
-# Detecta si corre como .exe (PyInstaller) o como script normal
+# Si corre como .exe (frozen), usa la carpeta del ejecutable
+# Si corre como .py, usa la carpeta del script
 if getattr(sys, 'frozen', False):
     BASE_DIR = Path(sys.executable).parent
 else:
@@ -30,6 +31,11 @@ ENCODINGS_FILE = BASE_DIR / "encodings.pkl"
 MARCAS_FILE    = BASE_DIR / "marcas.xlsx"
 
 FOTOS_DIR.mkdir(exist_ok=True)
+
+# ── Configuración de reconocimiento ──
+UMBRAL_RECONOCIMIENTO = 0.4   # más bajo = más estricto (0.4 recomendado)
+MAX_FOTOS             = 10    # fotos por profesor
+COOLDOWN_SEGUNDOS     = 7     # tiempo entre marcas = duración de la notificación
 
 
 # ──────────────────────────────────────────
@@ -46,7 +52,6 @@ def cargar_encodings():
             raise ValueError("Formato inesperado")
         return datos
     except Exception:
-        # Archivo corrupto: hacer backup y arrancar limpio
         backup = ENCODINGS_FILE.with_suffix(".pkl.bak")
         try:
             ENCODINGS_FILE.rename(backup)
@@ -69,19 +74,16 @@ def guardar_encodings(encodings):
 def registrar_marca(nombre):
     """Agrega una fila al Excel con entrada o salida."""
     hoy = datetime.now().strftime("%Y-%m-%d")
-    hora = datetime.now().strftime("%H:%M:%S")
+    hora = datetime.now().strftime("%I:%M:%S %p")
     COLUMNAS = ["Nombre", "Fecha", "Hora", "Tipo"]
 
-    # Cargar marcas existentes
     if MARCAS_FILE.exists():
         try:
             df = pd.read_excel(MARCAS_FILE)
-            # Validar que tenga las columnas esperadas
             cols_faltantes = [c for c in COLUMNAS if c not in df.columns]
             if cols_faltantes:
                 raise ValueError(f"Columnas faltantes: {cols_faltantes}")
         except Exception as e:
-            # Archivo dañado o editado incorrectamente — hacer backup y empezar limpio
             backup = MARCAS_FILE.with_suffix(".bak.xlsx")
             try:
                 import shutil
@@ -98,14 +100,12 @@ def registrar_marca(nombre):
     else:
         df = pd.DataFrame(columns=COLUMNAS)
 
-    # Determinar si es entrada o salida
     marcas_hoy = df[(df["Nombre"] == nombre) & (df["Fecha"] == hoy)]
     if len(marcas_hoy) % 2 == 0:
         tipo = "Entrada"
     else:
         tipo = "Salida"
 
-    # Agregar fila
     nueva = pd.DataFrame([{"Nombre": nombre, "Fecha": hoy, "Hora": hora, "Tipo": tipo}])
     df = pd.concat([df, nueva], ignore_index=True)
 
@@ -125,98 +125,187 @@ def registrar_marca(nombre):
 # ──────────────────────────────────────────
 class NotificacionMarca(tk.Toplevel):
     """
-    Popup grande que aparece al registrar una marca.
-    Se cierra solo después de 4 segundos o al hacer clic.
+    Ventana de confirmación de una marca.
+
+    Importante:
+    No usamos overrideredirect() porque en algunos equipos Windows/Tkinter
+    puede producir una ventana blanca aunque los widgets sí existan.
     """
-    DURACION_MS = 4000
+
+    DURACION_MS = COOLDOWN_SEGUNDOS * 1000
 
     def __init__(self, parent, nombre, tipo, hora, foto_path=None):
         super().__init__(parent)
-        self.overrideredirect(True)   # sin barra de título
-        self.attributes("-topmost", True)
+
+        # Ventana normal de Tkinter para evitar el problema de renderizado
+        # que puede producir overrideredirect(True) en Windows.
+        self.title("Marca registrada")
+        self.resizable(False, False)
         self.configure(bg="#ffffff")
 
-        es_entrada = tipo == "Entrada"
-        color_bg   = "#0F6E56" if es_entrada else "#3C3489"
-        icono      = "⬆  ENTRADA" if es_entrada else "⬇  SALIDA"
+        # Mantener la notificación por encima de las demás ventanas.
+        self.attributes("-topmost", True)
 
-        # ── Barra de color superior ──
+        # Permitir cerrar con ESPACIO.
+        self.bind("<space>", lambda e: self.destroy())
+        self.bind("<Escape>", lambda e: self.destroy())
+
+        es_entrada = tipo == "Entrada"
+        color_bg = "#0F6E56" if es_entrada else "#3C3489"
+        icono = "⬆  ENTRADA" if es_entrada else "⬇  SALIDA"
+
+        # Barra superior
         barra = tk.Frame(self, bg=color_bg, height=8)
         barra.pack(fill="x")
 
-        # ── Cuerpo ──
-        cuerpo = tk.Frame(self, bg="#ffffff", padx=30, pady=20)
+        # Cuerpo
+        cuerpo = tk.Frame(
+            self,
+            bg="#ffffff",
+            padx=60,
+            pady=40
+)
         cuerpo.pack(fill="both", expand=True)
 
-        # Foto del profesor (si existe)
+        # Foto del profesor
         if foto_path and Path(foto_path).exists():
             try:
                 from PIL import Image, ImageTk, ImageDraw
-                img = Image.open(foto_path).convert("RGB")
-                img.thumbnail((72, 72))
-                # Recorte circular
+
+                img = Image.open(foto_path).convert("RGBA")
+                img.thumbnail((144, 144))
+
                 mask = Image.new("L", img.size, 0)
                 draw = ImageDraw.Draw(mask)
                 draw.ellipse((0, 0) + img.size, fill=255)
+
                 img.putalpha(mask)
+
                 self._foto_tk = ImageTk.PhotoImage(img)
-                tk.Label(cuerpo, image=self._foto_tk, bg="#ffffff").pack(pady=(0, 8))
-            except Exception:
-                pass
 
-        # Tipo (ENTRADA / SALIDA)
-        tk.Label(cuerpo, text=icono,
-                 font=("Helvetica", 13, "bold"),
-                 fg=color_bg, bg="#ffffff").pack()
+                tk.Label(
+                    cuerpo,
+                    image=self._foto_tk,
+                    bg="#ffffff",
+                    bd=0
+                ).pack(pady=(0, 8))
 
-        # Nombre del profesor
-        tk.Label(cuerpo, text=nombre,
-                 font=("Helvetica", 20, "bold"),
-                 fg="#1a1a1a", bg="#ffffff").pack(pady=(4, 2))
+            except Exception as e:
+                # La notificación debe funcionar aunque la foto falle.
+                print(f"No se pudo cargar la foto de la notificación: {e}")
+
+        # Tipo de marca
+        tk.Label(
+            cuerpo,
+            text=icono,
+            font=("Helvetica", 26, "bold"),
+            fg=color_bg,
+            bg="#ffffff"
+        ).pack()
+
+        # Nombre
+        tk.Label(
+            cuerpo,
+            text=nombre,
+            font=("Helvetica", 40, "bold"),
+            fg="#1a1a1a",
+            bg="#ffffff"
+        ).pack(pady=(4, 2))
 
         # Hora
-        tk.Label(cuerpo, text=hora,
-                 font=("Helvetica", 14),
-                 fg="#666666", bg="#ffffff").pack()
+        tk.Label(
+            cuerpo,
+            text=hora,
+            font=("Helvetica", 28),
+            fg="#666666",
+            bg="#ffffff"
+        ).pack()
 
-        # Barra de progreso de cuenta regresiva
+        # Barra de progreso
         self._barra_prog = ttk.Progressbar(
-            cuerpo, length=220, maximum=self.DURACION_MS, value=self.DURACION_MS
+            cuerpo,
+            length=440,
+            maximum=self.DURACION_MS,
+            value=self.DURACION_MS,
+            mode="determinate"
         )
         self._barra_prog.pack(pady=(14, 2))
-        tk.Label(cuerpo, text="Toca para cerrar",
-                 font=("Helvetica", 9), fg="#aaaaaa", bg="#ffffff").pack()
 
-        # ── Barra de color inferior ──
-        tk.Frame(self, bg=color_bg, height=8).pack(fill="x")
+        # Texto inferior
+        tk.Label(
+            cuerpo,
+            text="Presiona ESPACIO o cierra esta ventana",
+            font=("Helvetica", 18),
+            fg="#888888",
+            bg="#ffffff"
+        ).pack(pady=(2, 0))
 
-        # Centrar en la pantalla
-        self.update_idletasks()
-        ancho  = self.winfo_reqwidth()
-        alto   = self.winfo_reqheight()
-        x = (self.winfo_screenwidth()  // 2) - (ancho // 2)
-        y = (self.winfo_screenheight() // 2) - (alto // 2)
-        self.geometry(f"+{x}+{y}")
+        # Barra inferior
+        tk.Frame(
+            self,
+            bg=color_bg,
+            height=12
+        ).pack(fill="x")
 
-        # Cerrar al hacer clic en cualquier parte
+        # Cerrar haciendo clic en cualquier parte.
         self.bind("<Button-1>", lambda e: self.destroy())
+
         for widget in self.winfo_children():
             self._bind_clic(widget)
 
-        # Cuenta regresiva y cierre automático
         self._tiempo_restante = self.DURACION_MS
+
+        # Primero construir completamente la ventana.
+        # Luego calcular su tamaño y finalmente mostrarla.
+        self.after(50, self._mostrar)
+
+    def _mostrar(self):
+        if not self.winfo_exists():
+            return
+
+        # Forzar a Tkinter a calcular todos los widgets.
+        self.update_idletasks()
+
+        ancho = self.winfo_reqwidth()
+        alto = self.winfo_reqheight()
+
+        # Tamaño mínimo de seguridad.
+        ancho = max(ancho, 600)
+        alto = max(alto, 500)
+
+        x = (self.winfo_screenwidth() - ancho) // 2
+        y = (self.winfo_screenheight() - alto) // 2
+
+        self.geometry(f"{ancho}x{alto}+{x}+{y}")
+
+        # Mostrar y traer al frente.
+        self.deiconify()
+        self.lift()
+        self.attributes("-topmost", True)
+
+        # Intentar darle foco después de estar visible.
+        self.focus_force()
+
+        # Iniciar contador.
         self._tick()
 
     def _bind_clic(self, widget):
         widget.bind("<Button-1>", lambda e: self.destroy())
+
         for hijo in widget.winfo_children():
             self._bind_clic(hijo)
 
     def _tick(self):
         if not self.winfo_exists():
             return
+
         self._tiempo_restante -= 50
-        self._barra_prog["value"] = max(0, self._tiempo_restante)
+
+        self._barra_prog["value"] = max(
+            0,
+            self._tiempo_restante
+        )
+
         if self._tiempo_restante <= 0:
             self.destroy()
         else:
@@ -236,7 +325,6 @@ class AppPrincipal(tk.Tk):
         self._build_ui()
 
     def _build_ui(self):
-        # Encabezado
         header = tk.Frame(self, bg="#3C3489", height=70)
         header.pack(fill="x")
         tk.Label(
@@ -246,34 +334,28 @@ class AppPrincipal(tk.Tk):
             fg="white", bg="#3C3489"
         ).pack(pady=20)
 
-        # Contenedor de botones
         frame = tk.Frame(self, bg="#f5f5f0")
         frame.pack(expand=True, fill="both", padx=40, pady=20)
 
         botones = [
-            ("👤  Registrar Profesor",  "#3C3489", self.abrir_registro),
-            ("✅  Iniciar Marcas",       "#0F6E56", self.abrir_marcas),
-            ("📊  Ver Reportes",         "#854F0B", self.abrir_reportes),
+            ("👤  Registrar Profesor", "#3C3489", self.abrir_registro),
+            ("✅  Iniciar Marcas",      "#0F6E56", self.abrir_marcas),
+            ("📊  Ver Reportes",        "#854F0B", self.abrir_reportes),
         ]
 
         for texto, color, cmd in botones:
-            btn = tk.Button(
-                frame,
-                text=texto,
+            tk.Button(
+                frame, text=texto,
                 font=("Helvetica", 12),
                 bg=color, fg="white",
-                activebackground=color,
-                activeforeground="white",
-                relief="flat",
-                cursor="hand2",
-                command=cmd,
-                pady=10
-            )
-            btn.pack(fill="x", pady=6, ipady=2)
+                activebackground=color, activeforeground="white",
+                relief="flat", cursor="hand2",
+                command=cmd, pady=10
+            ).pack(fill="x", pady=6, ipady=2)
 
         tk.Label(
             self,
-            text="v1.0  •  Uso interno escolar",
+            text="v1.1  •  Uso interno escolar",
             font=("Helvetica", 9),
             fg="#888", bg="#f5f5f0"
         ).pack(pady=(0, 8))
@@ -330,15 +412,13 @@ class VentanaRegistro(tk.Toplevel):
         tk.Entry(form, textvariable=self.materia_var, font=("Helvetica", 11),
                  width=28).grid(row=1, column=1, padx=8)
 
-        # Estado de fotos
-        self.status_fotos = tk.Label(self, text="Fotos capturadas: 0 / 5",
+        self.status_fotos = tk.Label(self, text=f"Fotos capturadas: 0 / {MAX_FOTOS}",
                                      font=("Helvetica", 11), bg="#f5f5f0", fg="#555")
         self.status_fotos.pack(pady=(14, 2))
 
-        self.barra = ttk.Progressbar(self, length=300, maximum=5)
+        self.barra = ttk.Progressbar(self, length=300, maximum=MAX_FOTOS)
         self.barra.pack(pady=4)
 
-        # Botones
         btn_frame = tk.Frame(self, bg="#f5f5f0")
         btn_frame.pack(pady=14)
 
@@ -374,8 +454,22 @@ class VentanaRegistro(tk.Toplevel):
             )
             return
 
+        # Instrucciones por foto para forzar variedad de ángulos
+        INSTRUCCIONES = [
+            "Mira directo a la camara",
+            "Gira levemente a la DERECHA",
+            "Gira levemente a la IZQUIERDA",
+            "Inclina la cabeza hacia ARRIBA",
+            "Inclina la cabeza hacia ABAJO",
+            "Mira directo — con lentes si usas",
+            "Gira mas a la DERECHA",
+            "Gira mas a la IZQUIERDA",
+            "Expresion natural, directo",
+            "Ultima foto — directo a la camara",
+        ]
+
         fotos = []
-        avisos_sin_cara = 0  # para no spamear el aviso
+        avisos_sin_cara = 0
 
         while True:
             ret, frame = cap.read()
@@ -383,11 +477,15 @@ class VentanaRegistro(tk.Toplevel):
                 break
 
             display = frame.copy()
-            cv2.putText(display,
-                        f"ESPACIO=capturar ({len(fotos)}/5)  ESC=terminar",
-                        (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (100, 220, 100), 2)
+            instruccion = INSTRUCCIONES[len(fotos)] if len(fotos) < len(INSTRUCCIONES) else "Capturando..."
 
-            # Detectar cara en tiempo real
+            cv2.putText(display,
+                        f"ESPACIO=capturar ({len(fotos)}/{MAX_FOTOS})  ESC=terminar",
+                        (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (100, 220, 100), 2)
+            cv2.putText(display,
+                        f">> {instruccion}",
+                        (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 200, 0), 2)
+
             small = cv2.resize(frame, (0, 0), fx=0.25, fy=0.25)
             rgb_small = cv2.cvtColor(small, cv2.COLOR_BGR2RGB)
             locs = face_recognition.face_locations(rgb_small)
@@ -398,39 +496,37 @@ class VentanaRegistro(tk.Toplevel):
                     cv2.rectangle(display,
                                   (left*4, top*4), (right*4, bottom*4),
                                   (0, 200, 0), 2)
-                cv2.putText(display, "Cara detectada ✓", (10, 60),
+                cv2.putText(display, "Cara detectada", (10, 90),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 200, 0), 2)
             else:
                 avisos_sin_cara += 1
                 cv2.putText(display, "No se detecta cara — ajusta posicion",
-                            (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 80, 255), 2)
+                            (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 80, 255), 2)
 
             cv2.imshow("Captura de fotos — " + nombre, display)
             key = cv2.waitKey(1)
 
-            if key == 27:   # ESC
+            if key == 27:
                 break
-            if key == 32:   # ESPACIO
+            if key == 32:
                 if not locs:
-                    cv2.putText(display, "⚠ Ninguna cara visible — no se capturó",
-                                (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
+                    cv2.putText(display, "Ninguna cara visible — no se capturo",
+                                (10, 120), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
                     cv2.imshow("Captura de fotos — " + nombre, display)
                     cv2.waitKey(800)
                     continue
-
                 if len(locs) > 1:
-                    cv2.putText(display, "⚠ Más de una cara — acercate solo tú",
-                                (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 140, 255), 2)
+                    cv2.putText(display, "Mas de una cara — acercate solo tu",
+                                (10, 120), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 140, 255), 2)
                     cv2.imshow("Captura de fotos — " + nombre, display)
                     cv2.waitKey(800)
                     continue
-
                 fotos.append(frame.copy())
                 self.fotos_capturadas = fotos
-                self.status_fotos.config(text=f"Fotos capturadas: {len(fotos)} / 5")
+                self.status_fotos.config(text=f"Fotos capturadas: {len(fotos)} / {MAX_FOTOS}")
                 self.barra["value"] = len(fotos)
                 self.update()
-                if len(fotos) >= 5:
+                if len(fotos) >= MAX_FOTOS:
                     break
 
         cap.release()
@@ -480,7 +576,7 @@ class VentanaRegistro(tk.Toplevel):
         for i, foto in enumerate(self.fotos_capturadas):
             cv2.imwrite(str(carpeta / f"{i+1}.jpg"), foto)
 
-        # Generar encodings con reporte de cuántas fallaron
+        # Generar encodings
         lista_enc = []
         fotos_sin_cara = 0
 
@@ -525,7 +621,7 @@ class VentanaMarcas(tk.Toplevel):
         self.geometry("520x320")
         self.resizable(False, False)
         self.configure(bg="#f5f5f0")
-        self._corriendo = False   # flag para detener el hilo de cámara
+        self._corriendo = False
         self._hilo = None
         self._build_ui()
         self.protocol("WM_DELETE_WINDOW", self._al_cerrar)
@@ -563,7 +659,6 @@ class VentanaMarcas(tk.Toplevel):
         self.btn_detener.pack(side="left", padx=6)
 
     def log_msg(self, msg):
-        """Seguro para llamar desde cualquier hilo via after()."""
         def _escribir():
             self.log.config(state="normal")
             self.log.insert("end", msg + "\n")
@@ -572,7 +667,6 @@ class VentanaMarcas(tk.Toplevel):
         self.after(0, _escribir)
 
     def iniciar(self):
-        # Guard: no iniciar si ya hay un hilo corriendo
         if self._corriendo:
             messagebox.showwarning("Cámara activa", "La cámara ya está en uso. Presiná Detener primero.")
             return
@@ -586,7 +680,6 @@ class VentanaMarcas(tk.Toplevel):
         todos_enc = [enc for lista in encodings.values() for enc in lista]
         etiquetas = [nombre for nombre, lista in encodings.items() for _ in lista]
 
-        # Intentar abrir la cámara con reintentos
         cap = None
         for intento in range(3):
             cap = cv2.VideoCapture(0)
@@ -628,12 +721,10 @@ class VentanaMarcas(tk.Toplevel):
         self.destroy()
 
     def _loop_camara(self, cap, todos_enc, etiquetas):
-        """Corre en un hilo secundario — NUNCA toca widgets Tk directamente."""
         self.after(0, lambda: self.log_msg("▶ Cámara iniciada. Esperando profesores..."))
         ultimo_reconocido = {}
-
         fallos_consecutivos = 0
-        MAX_FALLOS = 30  # ~1 segundo a 30fps
+        MAX_FALLOS = 30
 
         while self._corriendo:
             ret, frame = cap.read()
@@ -660,12 +751,12 @@ class VentanaMarcas(tk.Toplevel):
                 distancias = face_recognition.face_distance(todos_enc, encode_actual)
                 idx = np.argmin(distancias)
 
-                if distancias[idx] < 0.5:
+                if distancias[idx] < UMBRAL_RECONOCIMIENTO:
                     nombre = etiquetas[idx]
 
                     ahora = datetime.now()
                     ultima = ultimo_reconocido.get(nombre)
-                    if ultima and (ahora - ultima).seconds < 10:
+                    if ultima and (ahora - ultima).seconds < COOLDOWN_SEGUNDOS:
                         continue
 
                     try:
@@ -679,7 +770,6 @@ class VentanaMarcas(tk.Toplevel):
                     ultimo_reconocido[nombre] = ahora
                     self.log_msg(f"[{hora}]  {nombre}  →  {tipo}")
 
-                    # Foto del profesor
                     foto_path = None
                     carpeta_fotos = FOTOS_DIR / nombre
                     if carpeta_fotos.exists():
@@ -687,7 +777,6 @@ class VentanaMarcas(tk.Toplevel):
                         if fotos:
                             foto_path = str(fotos[0])
 
-                    # Notificación — siempre via after() para ejecutar en hilo principal
                     self.after(0, lambda n=nombre, t=tipo, h=hora, f=foto_path:
                                NotificacionMarca(self.master, n, t, h, f))
 
@@ -734,7 +823,6 @@ class VentanaReportes(tk.Toplevel):
         tk.Label(self, text="Reportes de Asistencia", font=("Helvetica", 14, "bold"),
                  bg="#f5f5f0").pack(pady=(14, 4))
 
-        # Filtro por fecha
         filtro_frame = tk.Frame(self, bg="#f5f5f0")
         filtro_frame.pack(pady=4)
         tk.Label(filtro_frame, text="Filtrar por fecha (YYYY-MM-DD):",
@@ -749,7 +837,6 @@ class VentanaReportes(tk.Toplevel):
                   relief="flat", cursor="hand2", font=("Helvetica", 10),
                   command=self.ver_todo).pack(side="left", padx=4)
 
-        # Tabla
         cols = ("Nombre", "Fecha", "Hora", "Tipo")
         self.tree = ttk.Treeview(self, columns=cols, show="headings", height=14)
         for col in cols:
@@ -757,11 +844,9 @@ class VentanaReportes(tk.Toplevel):
             self.tree.column(col, width=150, anchor="center")
         self.tree.pack(padx=20, pady=8, fill="both", expand=True)
 
-        # Scrollbar
         sb = ttk.Scrollbar(self, orient="vertical", command=self.tree.yview)
         self.tree.configure(yscrollcommand=sb.set)
 
-        # Botón exportar
         tk.Button(self, text="📥  Abrir archivo Excel", bg="#854F0B", fg="white",
                   font=("Helvetica", 10), relief="flat", cursor="hand2",
                   command=self.abrir_excel).pack(pady=6)
@@ -775,7 +860,6 @@ class VentanaReportes(tk.Toplevel):
 
         fecha = self.fecha_var.get().strip()
 
-        # Validar formato de fecha si se ingresó algo
         if fecha:
             try:
                 datetime.strptime(fecha, "%Y-%m-%d")
@@ -818,7 +902,7 @@ class VentanaReportes(tk.Toplevel):
         if not MARCAS_FILE.exists():
             messagebox.showinfo("Sin datos", "Aún no hay marcas registradas.")
             return
-        import subprocess
+        import subprocess, sys
         if sys.platform == "win32":
             os.startfile(str(MARCAS_FILE))
         elif sys.platform == "darwin":
